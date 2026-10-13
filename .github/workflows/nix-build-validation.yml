@@ -1,4 +1,4 @@
-name: Nix packaging validation
+name: Nix packaging diagnostics
 
 on:
   push:
@@ -6,122 +6,22 @@ on:
 
 permissions:
   contents: read
-
-concurrency:
-  group: nix-packaging-validation
-  cancel-in-progress: true
+  actions: read
 
 jobs:
-  validate:
+  collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - name: Export failed build log
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/Tr0sT/paperclip/actions/jobs/115200243620/logs > /tmp/nix-build.log
+          tail -200 /tmp/nix-build.log > /tmp/nix-build-tail.txt
+          cat /tmp/nix-build-tail.txt
+      - uses: actions/upload-artifact@v4
         with:
-          persist-credentials: false
-      - uses: cachix/install-nix-action@v31
-        with:
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-            system-features = nixos-test benchmark big-parallel kvm
-            cores = 2
-            max-jobs = 2
-      - name: Apply candidate packaging changes in this validation checkout
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path('flake.nix')
-          text = p.read_text()
-          def replace_once(old, new):
-              global text
-              assert text.count(old) == 1, repr(old)
-              text = text.replace(old, new)
-          replace_once('            pnpm = pkgs.pnpm_10;', '            pnpm = pkgs.pnpm_10;\n            pythonWithYaml = pkgs.python3.withPackages (ps: [ ps.pyyaml ]);')
-          replace_once('              strictDeps = true;', '''              strictDeps = true;
-
-                        # Cargo runs as part of the upstream Runner build. Vendor every
-                        # crate from the committed lockfile before entering the sandbox.
-                        cargoRoot = "packages/paperclip-runner/runner";
-                        cargoDeps = pkgs.rustPlatform.importCargoLock {
-                          lockFile = ./packages/paperclip-runner/runner/Cargo.lock;
-                        };
-                        CARGO_NET_OFFLINE = "true";
-                        # CMake is for native Cargo dependencies, not this JS project.
-                        dontUseCmakeConfigure = true;'''.replace('\n          ', '\n'))
-          replace_once('                pkgs.pnpmConfigHook\n', '                pkgs.pnpmConfigHook\n                pkgs.cargo\n                pkgs.rustc\n                pkgs.rustPlatform.cargoSetupHook\n                pkgs.cmake\n                pkgs.perl\n')
-          start = text.index('                substituteInPlace pnpm-lock.yaml')
-          end = text.index("\n              '';", start)
-          text = text[:start] + '                ${pythonWithYaml}/bin/python ${./nix/normalize-pnpm-lock.py} pnpm-lock.yaml' + text[end:]
-          replace_once('                runHook preBuild\n', '''                runHook preBuild
-
-                          export CARGO_BUILD_JOBS="''${NIX_BUILD_CORES:-1}"
-          '''.replace('\n          ', '\n'))
-          replace_once('                test -f cli/dist/index.js', '''                test -f cli/dist/index.js
-                          test -x packages/paperclip-runner/dist/bin/paperclip-runnerd
-                          test -x server/dist/vendor/paperclip-runner/bin/paperclip-runnerd
-
-                          # The staged binaries are runtime inputs; Cargo's target cache
-                          # is not. Do not copy gigabytes of build artifacts into $out.
-                          rm -rf packages/paperclip-runner/runner/target'''.replace('\n          ', '\n'))
-          replace_once('              package = paperclip;\n', '''              package = paperclip;
-                        lockfile-normalization = pkgs.runCommand "paperclip-pnpm-lock-tests" {
-                          nativeBuildInputs = [ pythonWithYaml ];
-                        } ''
-                          mkdir -p nix/tests
-                          cp ${./nix/normalize-pnpm-lock.py} nix/normalize-pnpm-lock.py
-                          cp ${./nix/tests/test_normalize_pnpm_lock.py} nix/tests/test_normalize_pnpm_lock.py
-                          python -m unittest discover -s nix/tests -p 'test_*.py' -v
-                          touch "$out"
-                        '';
-          '''.replace('\n          ', '\n'))
-          replace_once('                pkgs.curl\n', '                pkgs.cargo\n                pkgs.rustc\n                pkgs.cmake\n                pkgs.perl\n                pkgs.curl\n')
-          p.write_text(text)
-          PY
-          nix fmt flake.nix
-          git diff --check
-          git diff -- flake.nix
-      - name: Evaluate all platforms and run normalizer tests
-        run: |
-          nix flake check --all-systems --no-build
-          nix build .#checks.x86_64-linux.lockfile-normalization --no-link -L
-      - name: Regenerate and verify the pnpm dependency hash
-        run: |
-          set +e
-          nix build .#paperclip.unwrapped.pnpmDeps --no-link -L 2>&1 | tee /tmp/pnpm-deps.log
-          status=${PIPESTATUS[0]}
-          set -e
-          if [ "$status" -ne 0 ]; then
-            python3 - <<'PY'
-          from pathlib import Path
-          import re
-          log = Path('/tmp/pnpm-deps.log').read_text()
-          hashes = re.findall(r'got:\s+(sha256-[A-Za-z0-9+/=]+)', log)
-          if len(hashes) != 1:
-              raise SystemExit('Dependency build failed without a unique hash mismatch; inspect the log.')
-          p = Path('flake.nix')
-          text = p.read_text()
-          old = 'sha256-xcAji32woqLG93dclH/hDaWyNUeLHWdXfW+AKeIPF7o='
-          assert text.count(old) == 1
-          p.write_text(text.replace(old, hashes[0]))
-          print('::notice title=PNPM_DEPS_HASH::' + hashes[0])
-          PY
-            nix build .#paperclip.unwrapped.pnpmDeps --no-link -L
-          fi
-          echo '=== VALIDATED FLAKE BEGIN ==='
-          cat flake.nix
-          echo '=== VALIDATED FLAKE END ==='
-      - name: Build the package with vendored Cargo dependencies
-        run: nix build .#paperclip --no-link -L
-      - name: Test the NixOS service in a VM
-        run: |
-          if [ -e /dev/kvm ]; then sudo chmod a+rw /dev/kvm; fi
-          nix build .#checks.x86_64-linux.nixos-module --no-link -L
-      - name: Save the candidate and validation logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: nix-packaging-candidate
-          path: |
-            flake.nix
-            /tmp/pnpm-deps.log
+          name: nix-build-diagnostics
+          path: /tmp/nix-build-tail.txt
           retention-days: 7
